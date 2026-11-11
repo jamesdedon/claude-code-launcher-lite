@@ -1,0 +1,513 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""claude-code-launcher (lite) — a single-file Python/GTK4 port of
+github.com/jamesdedon/claude-code-launcher, minus the animations.
+
+Same config (~/.config/claude-code-launcher/config.toml) and history
+($XDG_STATE_HOME/claude-code-launcher/history.toml) formats as the Rust
+original. Runtime deps on Debian: python3-gi + gir1.2-gtk-4.0.
+"""
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+APP_ID = "dev.dedon.ClaudeCodeLauncher"
+MAX_HEIGHT = 320
+MIN_HEIGHT = 48
+WIDTH = 540
+MAX_COMPLETIONS_SHOWN = 8
+
+DEFAULT_CONFIG = """\
+# claude-code-launcher config
+# Edit working_directory and terminal_command before launching.
+
+working_directory = "/absolute/path/to/your/projects/dir"
+terminal_command = ["foot", "--working-directory={cwd}", "claude", "{prompt}"]
+
+# Optional: a parent folder whose subdirectories become Ctrl+Tab targets.
+# projects_directory = "/home/you/Projects"
+#
+# Optional: explicit targets (appended after projects_directory entries).
+# [[projects]]
+# name = "notes"
+# path = "/home/you/Documents/notes"
+
+# history_size = 100
+# resume_args = ["--resume"]
+# title = "Ask Claude..."
+
+# [theme]
+# popup_background = "rgba(30, 30, 40, 0.92)"
+# popup_border = "rgba(255, 255, 255, 0.06)"
+# popup_text = "#f0f0f0"
+# placeholder_text = "rgba(240, 240, 240, 0.4)"
+# pill_background / pill_text / pill_border / completion_text
+# completion_selected_background / font_size / pill_font_size / completion_font_size
+"""
+
+
+# ---------------------------------------------------------------- paths/config
+
+def _xdg(var, fallback):
+    base = os.environ.get(var)
+    return Path(base) if base else Path.home() / fallback
+
+
+def config_path():
+    return _xdg("XDG_CONFIG_HOME", ".config") / "claude-code-launcher" / "config.toml"
+
+
+def history_path():
+    return _xdg("XDG_STATE_HOME", ".local/state") / "claude-code-launcher" / "history.toml"
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config(path):
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+    wd = cfg.get("working_directory")
+    tc = cfg.get("terminal_command")
+    if not isinstance(wd, str) or not wd:
+        raise ConfigError("working_directory is missing")
+    if not Path(wd).is_dir():
+        raise ConfigError(f"working_directory is not a directory:\n{wd}")
+    if not (isinstance(tc, list) and tc and all(isinstance(a, str) for a in tc)):
+        raise ConfigError("terminal_command must be a non-empty array of strings")
+    cfg.setdefault("history_size", 100)
+    cfg.setdefault("resume_args", ["--resume"])
+    cfg.setdefault("title", "Ask Claude...")
+    cfg.setdefault("theme", {})
+    return cfg
+
+
+def build_project_list(cfg):
+    out = []
+    pd = cfg.get("projects_directory")
+    if pd:
+        p = Path(os.path.expanduser(pd))
+        if not p.is_dir():
+            raise ConfigError(f"projects_directory is not a directory:\n{pd}")
+        out += sorted(
+            ((c.name, c) for c in p.iterdir() if c.is_dir() and not c.name.startswith(".")),
+            key=lambda t: t[0],
+        )
+    for entry in cfg.get("projects", []):
+        if isinstance(entry, dict) and entry.get("path"):
+            path = Path(os.path.expanduser(entry["path"]))
+            out.append((entry.get("name") or path.name, path))
+    return out
+
+
+# ---------------------------------------------------------------- history
+
+def load_history(path=None):
+    try:
+        with open(path or history_path(), "rb") as f:
+            entries = tomllib.load(f).get("entries", [])
+        return [e for e in entries if isinstance(e, str)]
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+
+def save_history(entries, path=None):
+    path = Path(path or history_path())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # JSON string escapes are a valid subset of TOML basic strings.
+        body = ",\n".join("    " + json.dumps(e, ensure_ascii=False) for e in entries)
+        path.write_text(f"entries = [\n{body},\n]\n" if entries else "entries = []\n")
+    except OSError:
+        pass
+
+
+def load_slash_commands():
+    d = Path.home() / ".claude" / "commands"
+    try:
+        return sorted(p.stem for p in d.iterdir() if p.suffix == ".md")
+    except OSError:
+        return []
+
+
+def slash_slug(text):
+    if not text.startswith("/"):
+        return None
+    rest = text[1:]
+    for i, ch in enumerate(rest):
+        if ch.isspace():
+            return rest[:i]
+    return rest
+
+
+# ---------------------------------------------------------------- launching
+
+def build_argv(prompt, cwd, template, extra_before_prompt):
+    """Substitute {cwd}/{prompt}; splice extra args before the {prompt} arg.
+    With no prompt, a bare "{prompt}" element is dropped entirely."""
+    args, spliced = [], False
+    for arg in template:
+        if not spliced and "{prompt}" in arg and extra_before_prompt:
+            args += extra_before_prompt
+            spliced = True
+        if prompt is None and arg == "{prompt}":
+            continue
+        args.append(arg.replace("{cwd}", str(cwd)).replace("{prompt}", prompt or ""))
+    if not spliced:
+        args += extra_before_prompt
+    if Path("/run/.containerenv").exists():
+        args = ["flatpak-spawn", "--host"] + args
+    return args
+
+
+def spawn(argv):
+    # No shell: {prompt} stays one argv element. New session so the terminal
+    # outlives the popup.
+    subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------- UI
+
+def build_css(t):
+    bg = t.get("popup_background", "rgba(30, 30, 40, 0.92)")
+    border = t.get("popup_border", "rgba(255, 255, 255, 0.06)")
+    text = t.get("popup_text", "#f0f0f0")
+    fs = t.get("font_size", "14pt")
+    return f"""
+window.launcher {{ background: transparent; }}
+box.popup {{
+    background: {bg}; border-radius: 14px; border: 1px solid {border};
+    padding: 10px;
+}}
+scrolledwindow {{ background: transparent; border: none; }}
+textview, textview text {{ background: transparent; color: {text}; font-size: {fs}; }}
+label.placeholder {{
+    color: {t.get("placeholder_text", "rgba(240, 240, 240, 0.4)")}; font-size: {fs};
+}}
+label.project-pill {{
+    background: {t.get("pill_background", bg)}; color: {t.get("pill_text", text)};
+    border: 1px solid {t.get("pill_border", border)};
+    font-size: {t.get("pill_font_size", "11pt")}; font-weight: 600;
+    padding: 4px 12px; border-radius: 999px;
+}}
+box.completions {{ margin-top: 6px; }}
+label.completion {{
+    color: {t.get("completion_text", "rgba(240, 240, 240, 0.85)")};
+    font-size: {t.get("completion_font_size", "11pt")};
+    padding: 4px 6px; border-radius: 6px;
+}}
+label.completion.selected {{
+    background: {t.get("completion_selected_background", "rgba(255, 255, 255, 0.10)")};
+}}
+"""
+
+
+def run():
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gio, Gtk
+
+    def show_error(parent, message, detail, then=None):
+        dlg = Gtk.AlertDialog(message=message, detail=detail, modal=True)
+        if then is None:
+            dlg.show(parent)
+        else:
+            dlg.choose(parent, None, lambda *_: then())
+
+    class Launcher:
+        def __init__(self, app, cfg, projects):
+            self.app = app
+            self.cfg = cfg
+            self.projects = projects
+            self.current_project = None  # None -> working_directory
+            self.history = load_history()
+            self.history_index = None
+            self.draft = ""
+            self.commands = load_slash_commands()
+            self.visible = []  # matching command names
+            self.selected = 0
+            self.suppress = False
+            self.closing = False
+            self.was_active = False
+            self.suppress_close = False
+
+            css = Gtk.CssProvider()
+            css.load_from_string(build_css(cfg["theme"]))
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+            self.view = Gtk.TextView(
+                accepts_tab=False, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                left_margin=2, right_margin=2, top_margin=2, bottom_margin=2,
+            )
+            self.buf = self.view.get_buffer()
+            scrolled = Gtk.ScrolledWindow(
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                propagate_natural_height=True, propagate_natural_width=True,
+                max_content_height=MAX_HEIGHT, min_content_height=MIN_HEIGHT,
+                max_content_width=WIDTH, min_content_width=WIDTH,
+                child=self.view,
+            )
+            self.placeholder = Gtk.Label(
+                label=cfg["title"], halign=Gtk.Align.START, valign=Gtk.Align.START,
+                can_target=False, margin_start=2, margin_top=2,
+            )
+            self.placeholder.add_css_class("placeholder")
+            overlay = Gtk.Overlay(child=scrolled)
+            overlay.add_overlay(self.placeholder)
+
+            self.completions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, visible=False)
+            self.completions.add_css_class("completions")
+
+            container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                margin_end=8, margin_bottom=8)
+            container.add_css_class("popup")
+            container.append(overlay)
+            container.append(self.completions)
+
+            self.pill = Gtk.Label(halign=Gtk.Align.END, valign=Gtk.Align.END,
+                                  can_target=False, visible=False)
+            self.pill.add_css_class("project-pill")
+            outer = Gtk.Overlay(child=container)
+            outer.add_overlay(self.pill)
+
+            self.win = Gtk.ApplicationWindow(
+                application=app, title="Claude Code Launcher",
+                default_width=WIDTH + 28, decorated=False, resizable=False,
+                child=Gtk.WindowHandle(child=outer),
+            )
+            self.win.add_css_class("launcher")
+
+            self.buf.connect("changed", self.on_changed)
+            keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self.on_key)
+            self.view.add_controller(keys)
+
+            # Clicking/dragging the popup briefly drops focus on some compositors;
+            # don't treat that as "dismiss".
+            press = Gtk.GestureClick(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+            press.connect("pressed", lambda *_: setattr(self, "suppress_close", True))
+            self.win.add_controller(press)
+            self.win.connect("notify::is-active", self.on_active)
+
+            self.win.present()
+            self.view.grab_focus()
+
+        # -- helpers
+        def text(self):
+            s, e = self.buf.get_bounds()
+            return self.buf.get_text(s, e, False)
+
+        def set_text(self, t):
+            self.suppress = True
+            self.buf.set_text(t)
+            self.buf.place_cursor(self.buf.get_end_iter())
+            self.suppress = False
+
+        def close(self):
+            if not self.closing:
+                self.closing = True
+                self.win.close()
+
+        def cwd(self):
+            if self.current_project is None:
+                return Path(self.cfg["working_directory"])
+            return self.projects[self.current_project][1]
+
+        def render_completions(self):
+            child = self.completions.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                self.completions.remove(child)
+                child = nxt
+            for i, name in enumerate(self.visible):
+                row = Gtk.Label(label="/" + name, halign=Gtk.Align.FILL, xalign=0)
+                row.add_css_class("completion")
+                if i == self.selected:
+                    row.add_css_class("selected")
+                self.completions.append(row)
+            self.completions.set_visible(bool(self.visible))
+
+        def accept_completion(self):
+            text = self.text()
+            slug = slash_slug(text)
+            if slug is None or not self.visible:
+                return
+            rest = text[len(slug) + 1:]
+            name = self.visible[self.selected]
+            new = f"/{name}" + ("" if rest[:1].isspace() else " ")
+            self.suppress = True
+            self.buf.set_text(new + rest)
+            self.buf.place_cursor(self.buf.get_iter_at_offset(len(new)))
+            self.suppress = False
+            self.visible = []
+            self.render_completions()
+
+        def record(self, prompt):
+            if not prompt or (self.history and self.history[-1] == prompt):
+                return
+            self.history.append(prompt)
+            self.history = self.history[-max(1, int(self.cfg["history_size"])):]
+            save_history(self.history)
+
+        def history_nav(self, older):
+            line = self.buf.get_iter_at_mark(self.buf.get_insert()).get_line()
+            if older and line != 0:
+                return False
+            if not older and line != self.buf.get_line_count() - 1:
+                return False
+            if not self.history:
+                return False
+            idx = self.history_index
+            if older:
+                if idx is None:
+                    self.draft = self.text()
+                    idx = len(self.history) - 1
+                elif idx == 0:
+                    return True
+                else:
+                    idx -= 1
+            else:
+                if idx is None:
+                    return True
+                idx = None if idx + 1 >= len(self.history) else idx + 1
+            self.history_index = idx
+            self.set_text(self.history[idx] if idx is not None else self.draft)
+            return True
+
+        # -- signals
+        def on_changed(self, buf):
+            self.placeholder.set_visible(buf.get_char_count() == 0)
+            if self.suppress:
+                return
+            self.history_index = None
+            self.selected = 0
+            slug = slash_slug(self.text())
+            self.visible = (
+                [c for c in self.commands if c.startswith(slug)][:MAX_COMPLETIONS_SHOWN]
+                if slug is not None else []
+            )
+            self.render_completions()
+
+        def on_active(self, win, _pspec):
+            if win.is_active():
+                self.was_active = True
+            elif self.was_active and not self.closing:
+                if self.suppress_close:
+                    self.suppress_close = False
+                elif self.buf.get_char_count() == 0:
+                    self.close()
+
+        def on_key(self, _ctl, key, _code, mods):
+            shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
+            ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+            K = Gdk
+
+            if key == K.KEY_Escape:
+                if self.visible:
+                    self.visible = []
+                    self.render_completions()
+                else:
+                    self.close()
+                return True
+
+            is_tab = key in (K.KEY_Tab, K.KEY_ISO_Left_Tab)
+            if is_tab and not ctrl and self.visible:
+                self.accept_completion()
+                return True
+
+            if key in (K.KEY_Return, K.KEY_KP_Enter) and not shift:
+                prompt = self.text().strip()
+                if not prompt and not ctrl:
+                    return True
+                self.record(prompt)
+                argv = build_argv(
+                    prompt or None, self.cwd(), self.cfg["terminal_command"],
+                    list(self.cfg["resume_args"]) if ctrl else [],
+                )
+                try:
+                    spawn(argv)
+                except OSError as e:
+                    show_error(self.win, "Failed to launch", f"{argv[0]}: {e}")
+                    return True
+                self.close()
+                return True
+
+            if is_tab and ctrl:
+                if self.projects:
+                    n, cur = len(self.projects), self.current_project
+                    fwd = key == K.KEY_Tab and not shift
+                    if cur is None:
+                        cur = 0 if fwd else n - 1
+                    elif fwd:
+                        cur = None if cur + 1 == n else cur + 1
+                    else:
+                        cur = None if cur == 0 else cur - 1
+                    self.current_project = cur
+                    if cur is None:
+                        self.pill.set_visible(False)
+                    else:
+                        self.pill.set_label(f"Target: {self.projects[cur][0]}")
+                        self.pill.set_visible(True)
+                return True
+
+            is_up = key in (K.KEY_Up, K.KEY_KP_Up)
+            is_down = key in (K.KEY_Down, K.KEY_KP_Down)
+            if (is_up or is_down) and not ctrl and not shift:
+                if self.visible:
+                    n = len(self.visible)
+                    self.selected = (self.selected + (1 if is_down else -1)) % n
+                    self.render_completions()
+                    return True
+                if self.history_nav(is_up):
+                    return True
+            return False
+
+    def activate(app):
+        def fail(message, detail):
+            app.hold()  # keep running until the dialog is dismissed
+            show_error(None, message, detail,
+                       then=lambda: (app.release(), app.quit()))
+
+        if app.get_windows():  # second invocation: just raise the popup
+            app.get_windows()[0].present()
+            return
+        path = config_path()
+        if not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(DEFAULT_CONFIG)
+                detail = f"A starter config was written to\n{path}\nEdit it and relaunch."
+            except OSError as e:
+                detail = f"Could not write {path}: {e}"
+            fail("Claude Code Launcher needs configuring", detail)
+            return
+        try:
+            cfg = load_config(path)
+            projects = build_project_list(cfg)
+        except (OSError, tomllib.TOMLDecodeError, ConfigError) as e:
+            fail("Invalid config", f"{path}\n\n{e}")
+            return
+        app._launcher = Launcher(app, cfg, projects)
+
+    app = Gtk.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(run())
